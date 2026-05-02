@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=gipfel-infra
-#SBATCH --account=infra01
+#SBATCH --account=lsaie-ss26
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x-%j.log
 #SBATCH --error=logs/%x-%j.log
 
-WORKDIR=/users/schlag/gipfelsturm
+WORKDIR=/users/course_00269/lsaie-ss26-gipfelsturm
 
 mkdir -p logs
 
