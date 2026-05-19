@@ -11,6 +11,12 @@
 # Nodes:     optional, default 4 (max 8)
 #
 # Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]
+#
+# Optional environment variables for ablations without changing positional args:
+#   RUNTIME_MODE=eager|cuda_graph_te|cuda_graph_local_full   default: eager
+#   PROFILE_MODE=none|nsys                                  default: none
+#   TE_PRECISION_CONFIG_FILE=/path/to/te_precision.json      optional per-module TE precision config
+#   MBS_OVERRIDE=<int>                                       optional micro-batch override
 
 set -euo pipefail
 
@@ -58,6 +64,10 @@ case $MODE in
         ;;
 esac
 
+# Forward any additional arguments after attn_backend directly to Megatron-LM.
+# Example: ./launch_ablation.sh throughput 1.5b 50 4 1 1 1 4096 auto --fp8-format hybrid
+EXTRA_ARGS=("${@:10}")
+
 if (( TP * PP * CP > NODES * 4 )); then
     echo "Invalid parallelism: TP*PP*CP=$((TP * PP * CP)) > total GPUs=$((NODES * 4))"
     exit 1
@@ -95,8 +105,39 @@ case $MODEL_SIZE in
         ;;
 esac
 
+# Optional ablation controls. Keep these as environment variables so the
+# normal launch interface stays unchanged.
+RUNTIME_MODE=${RUNTIME_MODE:-eager}
+PROFILE_MODE=${PROFILE_MODE:-none}
+TE_PRECISION_CONFIG_FILE=${TE_PRECISION_CONFIG_FILE:-}
+if [ -n "${MBS_OVERRIDE:-}" ]; then
+    MBS=${MBS_OVERRIDE}
+fi
+
+case "$RUNTIME_MODE" in
+    eager|cuda_graph_te|cuda_graph_local_full) ;;
+    *)
+        echo "Unknown RUNTIME_MODE=$RUNTIME_MODE. Choose: eager, cuda_graph_te, cuda_graph_local_full"
+        exit 1
+        ;;
+esac
+
+case "$PROFILE_MODE" in
+    none|nsys) ;;
+    *)
+        echo "Unknown PROFILE_MODE=$PROFILE_MODE. Choose: none, nsys"
+        exit 1
+        ;;
+esac
+
 GBS=256
-JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n-tp${TP}-pp${PP}-cp${CP}-s${SEQ_LEN}-${ATTN_BACKEND}"
+JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n-tp${TP}-pp${PP}-cp${CP}-s${SEQ_LEN}-${ATTN_BACKEND}-${RUNTIME_MODE}"
+if [ -n "$TE_PRECISION_CONFIG_FILE" ]; then
+    JOB_NAME="${JOB_NAME}-teprec"
+fi
+if [ "$PROFILE_MODE" != "none" ]; then
+    JOB_NAME="${JOB_NAME}-${PROFILE_MODE}"
+fi
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
     WANDB_BLOCK='
@@ -162,6 +203,10 @@ TP=${TP}
 PP=${PP}
 CP=${CP}
 ATTN_BACKEND=${ATTN_BACKEND}
+RUNTIME_MODE=${RUNTIME_MODE}
+PROFILE_MODE=${PROFILE_MODE}
+TE_PRECISION_CONFIG_FILE=${TE_PRECISION_CONFIG_FILE}
+EXTRA_ARGS=(${EXTRA_ARGS[@]@Q})
 
 # Logging
 PROJECT_NAME=gipfelsturm
@@ -197,6 +242,35 @@ TRANSFORMER_ENGINE_ARGS=(
 ATTENTION_ARGS=()
 if [ "$ATTN_BACKEND" != "auto" ]; then
     ATTENTION_ARGS+=(--attention-backend "$ATTN_BACKEND")
+fi
+
+RUNTIME_ARGS=()
+case "$RUNTIME_MODE" in
+    eager)
+        ;;
+    cuda_graph_te)
+        # Transformer Engine CUDA graphs capture layer-level regions.
+        RUNTIME_ARGS+=(--cuda-graph-impl transformer_engine)
+        ;;
+    cuda_graph_local_full)
+        # Full training iteration capture. Requires --no-check-for-nan-in-loss-and-grad,
+        # which is already set in TRAINING_ARGS below.
+        RUNTIME_ARGS+=(--cuda-graph-impl local --cuda-graph-scope full_iteration)
+        ;;
+esac
+
+TE_PRECISION_ARGS=()
+if [ -n "$TE_PRECISION_CONFIG_FILE" ]; then
+    TE_PRECISION_ARGS+=(--te-precision-config-file "$TE_PRECISION_CONFIG_FILE")
+fi
+
+MEGATRON_EXTRA_ARGS=("${EXTRA_ARGS[@]}")
+
+PROFILE_PREFIX=()
+if [ "$PROFILE_MODE" = "nsys" ]; then
+    PROFILE_DIR="$LOG_DIR/nsys"
+    mkdir -p "$PROFILE_DIR"
+    PROFILE_PREFIX=(nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt,cublas,cudnn,nccl --output "$PROFILE_DIR/${EXP_NAME}-%q{SLURM_PROCID}")
 fi
 
 SETUP
@@ -309,6 +383,9 @@ TORCHRUN_ARGS=(
 TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TRANSFORMER_ENGINE_ARGS[@]} \
     ${ATTENTION_ARGS[@]} \
+    ${RUNTIME_ARGS[@]} \
+    ${TE_PRECISION_ARGS[@]} \
+    ${MEGATRON_EXTRA_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
@@ -333,8 +410,8 @@ WANDB_INSERT
 
 cat >> "$SCRIPT" << 'FOOTER'
 
-echo "CMD: $TRAINING_CMD"
-srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 $TRAINING_CMD"
+echo "CMD: ${PROFILE_PREFIX[*]} $TRAINING_CMD"
+srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 ${PROFILE_PREFIX[*]} $TRAINING_CMD"
 
 echo "END TIME: $(date)"
 FOOTER
