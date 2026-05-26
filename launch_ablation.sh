@@ -22,7 +22,7 @@ set -euo pipefail
 
 MODE=${1:?Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]}
 MODEL_SIZE=${2:?Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]}
-
+export WANDB_API_KEY=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
 ################ Mode config ################
 case $MODE in
     throughput)
@@ -33,7 +33,7 @@ case $MODE in
         CP=${7:-1}
         SEQ_LEN=${8:-4096}
         ATTN_BACKEND=${9:-auto}
-        TIME=00:30:00
+        TIME=01:30:00
         EVAL_INTERVAL=$TRAINING_STEPS
         EVAL_ITERS=0
         LR_WARMUP_ITERS=10
@@ -48,7 +48,7 @@ case $MODE in
         CP=${7:-1}
         SEQ_LEN=${8:-4096}
         ATTN_BACKEND=${9:-auto}
-        TIME=02:30:00
+        TIME=01:30:00
         EVAL_INTERVAL=1000
         EVAL_ITERS=10
         LR_WARMUP_ITERS=200
@@ -63,6 +63,10 @@ case $MODE in
         exit 1
         ;;
 esac
+
+# Forward any additional arguments after attn_backend directly to Megatron-LM.
+# Example: ./launch_ablation.sh throughput 1.5b 50 4 1 1 1 4096 auto --fp8-format hybrid
+EXTRA_ARGS=("${@:10}")
 
 if (( TP * PP * CP > NODES * 4 )); then
     echo "Invalid parallelism: TP*PP*CP=$((TP * PP * CP)) > total GPUs=$((NODES * 4))"
@@ -91,12 +95,16 @@ case $MODEL_SIZE in
         NUM_LAYERS=32; HIDDEN=3072; FFN=8192;  HEADS=24; KV_HEADS=8
         MBS=4
         ;;
+    4.5b)
+        NUM_LAYERS=41; HIDDEN=3072; FFN=8192; HEADS=24; KV_HEADS=8
+        MBS=1
+        ;;    
     8b)
         NUM_LAYERS=32; HIDDEN=4096; FFN=14336; HEADS=32; KV_HEADS=8
         MBS=2
         ;;
     *)
-        echo "Unknown model size: $MODEL_SIZE. Choose: 125m, 350m, 760m, 1.5b, 3b, 8b"
+        echo "Unknown model size: $MODEL_SIZE. Choose: 125m, 350m, 760m, 1.5b, 3b, 4.5b, 8b"
         exit 1
         ;;
 esac
@@ -134,6 +142,18 @@ fi
 if [ "$PROFILE_MODE" != "none" ]; then
     JOB_NAME="${JOB_NAME}-${PROFILE_MODE}"
 fi
+
+RUN_PREFIX=${RUN_PREFIX:-}
+RUN_SUFFIX=${RUN_SUFFIX:-}
+
+if [ -n "$RUN_PREFIX" ]; then
+    JOB_NAME="${RUN_PREFIX}-${JOB_NAME}"
+fi
+
+if [ -n "$RUN_SUFFIX" ]; then
+    JOB_NAME="${JOB_NAME}-${RUN_SUFFIX}"
+fi
+
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
     WANDB_BLOCK='
@@ -202,6 +222,7 @@ ATTN_BACKEND=${ATTN_BACKEND}
 RUNTIME_MODE=${RUNTIME_MODE}
 PROFILE_MODE=${PROFILE_MODE}
 TE_PRECISION_CONFIG_FILE=${TE_PRECISION_CONFIG_FILE}
+EXTRA_ARGS=(${EXTRA_ARGS[@]@Q})
 
 # Logging
 PROJECT_NAME=gipfelsturm
@@ -258,6 +279,8 @@ TE_PRECISION_ARGS=()
 if [ -n "$TE_PRECISION_CONFIG_FILE" ]; then
     TE_PRECISION_ARGS+=(--te-precision-config-file "$TE_PRECISION_CONFIG_FILE")
 fi
+
+MEGATRON_EXTRA_ARGS=("${EXTRA_ARGS[@]}")
 
 PROFILE_PREFIX=()
 if [ "$PROFILE_MODE" = "nsys" ]; then
@@ -378,6 +401,7 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${ATTENTION_ARGS[@]} \
     ${RUNTIME_ARGS[@]} \
     ${TE_PRECISION_ARGS[@]} \
+    ${MEGATRON_EXTRA_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \

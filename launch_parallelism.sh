@@ -11,12 +11,6 @@
 # Nodes:     optional, default 4 (max 8)
 #
 # Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]
-#
-# Optional environment variables for ablations without changing positional args:
-#   RUNTIME_MODE=eager|cuda_graph_te|cuda_graph_local_full   default: eager
-#   PROFILE_MODE=none|nsys                                  default: none
-#   TE_PRECISION_CONFIG_FILE=/path/to/te_precision.json      optional per-module TE precision config
-#   MBS_OVERRIDE=<int>                                       optional micro-batch override
 
 set -euo pipefail
 
@@ -48,7 +42,7 @@ case $MODE in
         CP=${7:-1}
         SEQ_LEN=${8:-4096}
         ATTN_BACKEND=${9:-auto}
-        TIME=02:30:00
+        TIME=02:00:00
         EVAL_INTERVAL=1000
         EVAL_ITERS=10
         LR_WARMUP_ITERS=200
@@ -64,8 +58,6 @@ case $MODE in
         ;;
 esac
 
-# Forward any additional arguments after attn_backend directly to Megatron-LM.
-# Example: ./launch_ablation.sh throughput 1.5b 50 4 1 1 1 4096 auto --fp8-format hybrid
 EXTRA_ARGS=("${@:10}")
 
 if (( TP * PP * CP > NODES * 4 )); then
@@ -95,48 +87,26 @@ case $MODEL_SIZE in
         NUM_LAYERS=32; HIDDEN=3072; FFN=8192;  HEADS=24; KV_HEADS=8
         MBS=4
         ;;
+    4.5b)
+        NUM_LAYERS=41; HIDDEN=3072; FFN=8192; HEADS=24; KV_HEADS=8
+        MBS=4
+        ;;    
     8b)
         NUM_LAYERS=32; HIDDEN=4096; FFN=14336; HEADS=32; KV_HEADS=8
         MBS=2
         ;;
     *)
-        echo "Unknown model size: $MODEL_SIZE. Choose: 125m, 350m, 760m, 1.5b, 3b, 8b"
-        exit 1
-        ;;
-esac
-
-# Optional ablation controls. Keep these as environment variables so the
-# normal launch interface stays unchanged.
-RUNTIME_MODE=${RUNTIME_MODE:-eager}
-PROFILE_MODE=${PROFILE_MODE:-none}
-TE_PRECISION_CONFIG_FILE=${TE_PRECISION_CONFIG_FILE:-}
-if [ -n "${MBS_OVERRIDE:-}" ]; then
-    MBS=${MBS_OVERRIDE}
-fi
-
-case "$RUNTIME_MODE" in
-    eager|cuda_graph_te|cuda_graph_local_full) ;;
-    *)
-        echo "Unknown RUNTIME_MODE=$RUNTIME_MODE. Choose: eager, cuda_graph_te, cuda_graph_local_full"
-        exit 1
-        ;;
-esac
-
-case "$PROFILE_MODE" in
-    none|nsys) ;;
-    *)
-        echo "Unknown PROFILE_MODE=$PROFILE_MODE. Choose: none, nsys"
+        echo "Unknown model size: $MODEL_SIZE. Choose: 125m, 350m, 760m, 1.5b, 3b, 4.5b, 8b"
         exit 1
         ;;
 esac
 
 GBS=256
-JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n-tp${TP}-pp${PP}-cp${CP}-s${SEQ_LEN}-${ATTN_BACKEND}-${RUNTIME_MODE}"
-if [ -n "$TE_PRECISION_CONFIG_FILE" ]; then
-    JOB_NAME="${JOB_NAME}-teprec"
-fi
-if [ "$PROFILE_MODE" != "none" ]; then
-    JOB_NAME="${JOB_NAME}-${PROFILE_MODE}"
+JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n-tp${TP}-pp${PP}-cp${CP}-s${SEQ_LEN}-${ATTN_BACKEND}"
+RUN_SUFFIX=${RUN_SUFFIX:-}
+
+if [ -n "$RUN_SUFFIX" ]; then
+    JOB_NAME="${JOB_NAME}-${RUN_SUFFIX}"
 fi
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
@@ -203,9 +173,6 @@ TP=${TP}
 PP=${PP}
 CP=${CP}
 ATTN_BACKEND=${ATTN_BACKEND}
-RUNTIME_MODE=${RUNTIME_MODE}
-PROFILE_MODE=${PROFILE_MODE}
-TE_PRECISION_CONFIG_FILE=${TE_PRECISION_CONFIG_FILE}
 EXTRA_ARGS=(${EXTRA_ARGS[@]@Q})
 
 # Logging
@@ -223,7 +190,8 @@ mkdir -p logs $LOG_DIR $TENSORBOARD_DIR $DATASET_CACHE_DIR
 
 cd $MEGATRON_LM_DIR
 flock $MEGATRON_LM_DIR/.git-lock bash -c "cd $MEGATRON_LM_DIR && git checkout -- . && git apply $WORKDIR/patches/*.patch"
-export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
+export FA3_PREFIX=/iopsstor/scratch/cscs/$USER/gipfelsturm/fa3_install
+export PYTHONPATH=$FA3_PREFIX/lib/python3.12/site-packages:$MEGATRON_LM_DIR:${PYTHONPATH:-}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -244,34 +212,7 @@ if [ "$ATTN_BACKEND" != "auto" ]; then
     ATTENTION_ARGS+=(--attention-backend "$ATTN_BACKEND")
 fi
 
-RUNTIME_ARGS=()
-case "$RUNTIME_MODE" in
-    eager)
-        ;;
-    cuda_graph_te)
-        # Transformer Engine CUDA graphs capture layer-level regions.
-        RUNTIME_ARGS+=(--cuda-graph-impl transformer_engine)
-        ;;
-    cuda_graph_local_full)
-        # Full training iteration capture. Requires --no-check-for-nan-in-loss-and-grad,
-        # which is already set in TRAINING_ARGS below.
-        RUNTIME_ARGS+=(--cuda-graph-impl local --cuda-graph-scope full_iteration)
-        ;;
-esac
-
-TE_PRECISION_ARGS=()
-if [ -n "$TE_PRECISION_CONFIG_FILE" ]; then
-    TE_PRECISION_ARGS+=(--te-precision-config-file "$TE_PRECISION_CONFIG_FILE")
-fi
-
 MEGATRON_EXTRA_ARGS=("${EXTRA_ARGS[@]}")
-
-PROFILE_PREFIX=()
-if [ "$PROFILE_MODE" = "nsys" ]; then
-    PROFILE_DIR="$LOG_DIR/nsys"
-    mkdir -p "$PROFILE_DIR"
-    PROFILE_PREFIX=(nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt,cublas,cudnn,nccl --output "$PROFILE_DIR/${EXP_NAME}-%q{SLURM_PROCID}")
-fi
 
 SETUP
 
@@ -383,8 +324,6 @@ TORCHRUN_ARGS=(
 TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TRANSFORMER_ENGINE_ARGS[@]} \
     ${ATTENTION_ARGS[@]} \
-    ${RUNTIME_ARGS[@]} \
-    ${TE_PRECISION_ARGS[@]} \
     ${MEGATRON_EXTRA_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
@@ -410,8 +349,8 @@ WANDB_INSERT
 
 cat >> "$SCRIPT" << 'FOOTER'
 
-echo "CMD: ${PROFILE_PREFIX[*]} $TRAINING_CMD"
-srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 ${PROFILE_PREFIX[*]} $TRAINING_CMD"
+echo "CMD: $TRAINING_CMD"
+srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 $TRAINING_CMD"
 
 echo "END TIME: $(date)"
 FOOTER

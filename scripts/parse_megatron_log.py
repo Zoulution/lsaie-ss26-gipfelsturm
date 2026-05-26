@@ -138,6 +138,6 @@ if __name__ == "__main__":
 
 
 # python3 scripts/parse_megatron_log.py \
-#   logs/gipfel-throughput-1.5b-50s-4n-tp1-pp1-cp1-s4096-auto-cuda_graph_te-2293512.log \
+#   logs/gipfel-throughput-4.5b-50s-4n-tp1-pp1-cp1-s4096-auto-2350068.log \
 #   --warmup 10 \
 #   --out results/runs.csv
