@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=00:10:00
+#SBATCH --time=00:20:00
 #SBATCH --output=fa3-shape-test-%j.log
 #SBATCH --error=fa3-shape-test-%j.err
 #SBATCH --no-requeue

@@ -1,0 +1,93 @@
+--- /users/course_00269/lsaie-ss26-gipfelsturm/Megatron-LM/megatron/core/extensions/transformer_engine.py	2026-04-24 22:33:49.949915338 +0200
++++ /users/course_00269/lsaie-ss26-gipfelsturm/Megatron-LM-fa3/megatron/core/extensions/transformer_engine.py	2026-05-27 01:28:20.776561986 +0200
+@@ -1176,6 +1176,9 @@
+             1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
+         )
+ 
++        self.use_fa3_direct = os.getenv("MEGATRON_USE_FA3_DIRECT", "0") == "1"
++        self.fa3_softmax_scale = softmax_scale
++
+         if self.config.apply_query_key_layer_scaling != bool(
+             int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))
+         ):
+@@ -1342,6 +1345,80 @@
+         num_splits: Optional[int] = None,
+     ) -> torch.Tensor:
+         """Forward."""
++        if getattr(self, "use_fa3_direct", False):
++            if packed_seq_params is not None:
++                raise RuntimeError(
++                    "MEGATRON_USE_FA3_DIRECT=1 does not support packed_seq_params/THD yet."
++                )
++            if attention_bias is not None:
++                raise RuntimeError(
++                    "MEGATRON_USE_FA3_DIRECT=1 does not support attention_bias yet."
++                )
++            if self.config.context_parallel_size != 1:
++                raise RuntimeError(
++                    "MEGATRON_USE_FA3_DIRECT=1 currently requires context_parallel_size=1."
++                )
++            if self.config.attention_dropout != 0.0:
++                raise RuntimeError(
++                    "MEGATRON_USE_FA3_DIRECT=1 currently requires attention_dropout=0.0."
++                )
++
++            try:
++                from flash_attn_interface import flash_attn_func
++            except ImportError:
++                from flash_attn_3.flash_attn_interface import flash_attn_func
++
++            if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
++                raise RuntimeError(
++                    f"FA3 direct path expected 4D q/k/v, got "
++                    f"{query.shape}, {key.shape}, {value.shape}"
++                )
++
++            causal = attn_mask_type.name in (
++                "causal",
++                "padding_causal",
++                "causal_bottom_right",
++            )
++
++            # FA3 expects [B, S, H, D].
++            # Megatron/TE may pass either [S, B, H, D] or [B, S, H, D].
++            if query.shape[0] == key.shape[0] and query.shape[0] > query.shape[1]:
++                q_bshd = query.transpose(0, 1).contiguous()
++                k_bshd = key.transpose(0, 1).contiguous()
++                v_bshd = value.transpose(0, 1).contiguous()
++                output_needs_transpose = True
++            else:
++                q_bshd = query.contiguous()
++                k_bshd = key.contiguous()
++                v_bshd = value.contiguous()
++                output_needs_transpose = False
++
++            out = flash_attn_func(
++                q_bshd,
++                k_bshd,
++                v_bshd,
++                causal=causal,
++                softmax_scale=self.fa3_softmax_scale,
++            )
++
++            if output_needs_transpose:
++                out = out.transpose(0, 1).contiguous()
++
++            # FA3 returns [S, B, H, D] or [B, S, H, D].
++            # Megatron's following linear projection expects heads flattened:
++            # [S, B, H * D] or [B, S, H * D].
++            out = out.reshape(*out.shape[:-2], out.shape[-2] * out.shape[-1]).contiguous()
++
++            if os.getenv("MEGATRON_FA3_DEBUG", "0") == "1":
++                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++                if rank == 0:
++                    print(
++                        f"[FA3 direct] q={tuple(query.shape)} k={tuple(key.shape)} "
++                        f"v={tuple(value.shape)} flattened_out={tuple(out.shape)} causal={causal}",
++                        flush=True,
++                    )
++
++            return out
+         if packed_seq_params is not None:
+             # If Dynamic CP group is provided, update TE DPA CP group
+             if packed_seq_params.cp_group is not None:
