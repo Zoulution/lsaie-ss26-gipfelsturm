@@ -60,6 +60,7 @@ Second, we evaluate optimization techniques on top of the baseline setup, includ
 ├── README.md                     # Project documentation
 ├── test_infra.py                 # Infrastructure test helper
 └── test-infra.sbatch             # Slurm script for infrastructure testing
+```
 
 ## Launch Script
 
