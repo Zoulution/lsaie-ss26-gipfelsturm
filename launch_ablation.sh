@@ -22,7 +22,12 @@ set -euo pipefail
 
 MODE=${1:?Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]}
 MODEL_SIZE=${2:?Usage: ./launch_auto.sh <mode> <model_size> [steps] [nodes] [tp] [pp] [cp] [seq_len] [attn_backend]}
-export WANDB_API_KEY=$secret_wandb_api_key
+
+set -a
+source .env
+set +a
+
+export WANDB_API_KEY=$WANDB_API_KEY
 ################ Mode config ################
 case $MODE in
     throughput)
@@ -33,7 +38,7 @@ case $MODE in
         CP=${7:-1}
         SEQ_LEN=${8:-4096}
         ATTN_BACKEND=${9:-auto}
-        TIME=01:30:00
+        TIME=0:30:00
         EVAL_INTERVAL=$TRAINING_STEPS
         EVAL_ITERS=0
         LR_WARMUP_ITERS=10
@@ -48,7 +53,7 @@ case $MODE in
         CP=${7:-1}
         SEQ_LEN=${8:-4096}
         ATTN_BACKEND=${9:-auto}
-        TIME=01:30:00
+        TIME=1:00:00
         EVAL_INTERVAL=1000
         EVAL_ITERS=10
         LR_WARMUP_ITERS=200
@@ -97,7 +102,7 @@ case $MODEL_SIZE in
         ;;
     4.5b)
         NUM_LAYERS=41; HIDDEN=3072; FFN=8192; HEADS=24; KV_HEADS=8
-        MBS=1
+        MBS=4
         ;;    
     8b)
         NUM_LAYERS=32; HIDDEN=4096; FFN=14336; HEADS=32; KV_HEADS=8
