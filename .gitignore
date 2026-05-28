@@ -1,4 +1,4 @@
 logs/
 data/climbmix_small/
 .env
-
+config.sh
